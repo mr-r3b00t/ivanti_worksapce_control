@@ -1442,7 +1442,7 @@ if ($ExportHtml) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IWC Allow List Audit Report - $hostName</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700&family=Source+Serif+4:wght@600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
     --white: #ffffff;
@@ -1475,11 +1475,11 @@ if ($ExportHtml) {
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-    font-size: 14px;
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 15px;
     background: var(--bg);
     color: var(--text);
-    line-height: 1.6;
+    line-height: 1.65;
     -webkit-font-smoothing: antialiased;
   }
 
@@ -1515,7 +1515,7 @@ if ($ExportHtml) {
     margin-bottom: 10px;
   }
   .header-title {
-    font-family: 'Source Serif 4', Georgia, serif;
+    font-family: 'IBM Plex Serif', Georgia, serif;
     font-size: 30px;
     font-weight: 700;
     letter-spacing: -0.5px;
@@ -1588,7 +1588,7 @@ if ($ExportHtml) {
 
   /* -- Section headers ---------------------------------------------------- */
   h2 {
-    font-family: 'Source Serif 4', Georgia, serif;
+    font-family: 'IBM Plex Serif', Georgia, serif;
     font-size: 22px;
     font-weight: 700;
     color: var(--brand);
@@ -1598,14 +1598,14 @@ if ($ExportHtml) {
     border-bottom: 2px solid var(--brand);
   }
   h2 .count {
-    font-family: 'DM Sans', sans-serif;
+    font-family: 'IBM Plex Sans', sans-serif;
     font-size: 14px;
     font-weight: 500;
     color: var(--text-muted);
     margin-left: 8px;
   }
   h3 {
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 600;
     color: var(--text);
     margin: 24px 0 10px 0;
@@ -1635,7 +1635,7 @@ if ($ExportHtml) {
   }
   .card:hover { box-shadow: var(--shadow-md); }
   .card-title {
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
     letter-spacing: 1.2px;
     text-transform: uppercase;
@@ -1643,7 +1643,7 @@ if ($ExportHtml) {
     margin-bottom: 10px;
   }
   .card-value {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: 'IBM Plex Mono', monospace;
     font-size: 32px;
     font-weight: 500;
     line-height: 1;
@@ -1653,7 +1653,7 @@ if ($ExportHtml) {
   .card-value.warn   { color: var(--amber); }
   .card-value.danger { color: var(--red); }
   .card-detail {
-    font-size: 12px;
+    font-size: 13px;
     color: var(--text-muted);
     margin-top: 8px;
     line-height: 1.4;
@@ -1680,13 +1680,13 @@ if ($ExportHtml) {
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13px;
+    font-size: 14px;
   }
   thead th {
     background: var(--surface-alt);
-    padding: 11px 14px;
+    padding: 12px 14px;
     text-align: left;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.8px;
@@ -1700,8 +1700,8 @@ if ($ExportHtml) {
     padding: 10px 14px;
     border-bottom: 1px solid var(--border-light);
     color: var(--text-secondary);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 13px;
     word-break: break-word;
     max-width: 420px;
   }
@@ -1751,15 +1751,15 @@ if ($ExportHtml) {
     color: var(--white);
   }
   .alert-title {
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 700;
     margin-bottom: 4px;
     color: var(--text);
   }
   .alert-body {
-    font-size: 13px;
+    font-size: 14px;
     color: var(--text-secondary);
-    line-height: 1.5;
+    line-height: 1.55;
   }
 
   /* -- Remediation box ---------------------------------------------------- */
@@ -1782,13 +1782,13 @@ if ($ExportHtml) {
   }
   .remediation li {
     padding: 6px 0;
-    font-size: 13px;
+    font-size: 14px;
     color: var(--text-secondary);
     line-height: 1.5;
   }
 
   /* -- Empty state -------------------------------------------------------- */
-  .empty { color: var(--text-muted); font-style: italic; padding: 16px 0; font-size: 13px; }
+  .empty { color: var(--text-muted); font-style: italic; padding: 16px 0; font-size: 14px; }
 
   /* -- Footer ------------------------------------------------------------- */
   .report-footer {
