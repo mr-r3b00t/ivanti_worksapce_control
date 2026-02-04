@@ -20,10 +20,15 @@
     Write, Modify, CreateFiles, or FullControl permissions. Any writable path is
     flagged as a potential privilege escalation / exe hijack vulnerability.
 
+    It also discovers all network shares (UNC paths) referenced in the config,
+    tests server reachability (TCP/445, ICMP, DNS), share accessibility, and
+    sub-path availability. Accessible and inaccessible shares are tracked
+    separately for reporting.
+
 .NOTES
     Must be run as Administrator to access Program Files cache and HKLM registry keys.
     Author:  Generated for IWC enumeration
-    Version: 2.0
+    Version: 3.0
 #>
 
 [CmdletBinding()]
@@ -62,24 +67,24 @@ $script:UserWriteNames = @(
     'Users'
 )
 
-# File permissions that allow overwriting an exe
-$script:DangerousFileRights = @(
-    [System.Security.AccessControl.FileSystemRights]::Write
-    [System.Security.AccessControl.FileSystemRights]::Modify
-    [System.Security.AccessControl.FileSystemRights]::FullControl
-    [System.Security.AccessControl.FileSystemRights]::WriteData
-    [System.Security.AccessControl.FileSystemRights]::AppendData
+# Bitmask of ONLY write-specific rights (individual bits, not composites).
+# Using individual bits avoids false positives: composite rights like Modify
+# and FullControl include ReadAndExecute bits, so checking
+# "ReadAndExecute -band Modify" incorrectly returns non-zero.
+# By only checking write-specific bits we ensure we only flag genuine
+# write/create/delete permissions.
+$script:FileWriteBitMask = [int](
+    [System.Security.AccessControl.FileSystemRights]::WriteData -bor              # 0x2 (CreateFiles)
+    [System.Security.AccessControl.FileSystemRights]::AppendData -bor             # 0x4 (CreateDirectories)
+    [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor # 0x10
+    [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor         # 0x100
+    [System.Security.AccessControl.FileSystemRights]::Delete -bor                  # 0x10000
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor       # 0x40000
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership                # 0x80000
 )
 
-# Folder permissions that allow creating/writing a new file
-$script:DangerousFolderRights = @(
-    [System.Security.AccessControl.FileSystemRights]::Write
-    [System.Security.AccessControl.FileSystemRights]::Modify
-    [System.Security.AccessControl.FileSystemRights]::FullControl
-    [System.Security.AccessControl.FileSystemRights]::CreateFiles
-    [System.Security.AccessControl.FileSystemRights]::WriteData
-    [System.Security.AccessControl.FileSystemRights]::AppendData
-)
+# Folder write mask -- same bits, focused on file creation
+$script:FolderWriteBitMask = $script:FileWriteBitMask
 
 function Resolve-EnvPath ([string]$PathString) {
     <# Expand %ENV_VAR% references and return the resolved path #>
@@ -158,17 +163,19 @@ function Test-UserCanWriteFile ([string]$FilePath) {
             if ($ace.AccessControlType -ne 'Allow') { continue }
             if (-not (Test-IdentityIsStandardUser $ace)) { continue }
 
-            # Check if any dangerous rights are granted
-            foreach ($right in $script:DangerousFileRights) {
-                if ($ace.FileSystemRights -band $right) {
-                    [void]$result.DangerousAces.Add([PSCustomObject]@{
-                        Identity = $ace.IdentityReference.Value
-                        Rights   = $ace.FileSystemRights.ToString()
-                        Inherited = $ace.IsInherited
-                    })
-                    $result.Writable = $true
-                    break
-                }
+            # Check if any write-specific bits are set
+            if (([int]$ace.FileSystemRights -band $script:FileWriteBitMask) -ne 0) {
+                # Identify which specific write rights are present
+                $matchedRights = [System.Security.AccessControl.FileSystemRights](
+                    [int]$ace.FileSystemRights -band $script:FileWriteBitMask
+                )
+                [void]$result.DangerousAces.Add([PSCustomObject]@{
+                    Identity      = $ace.IdentityReference.Value
+                    Rights        = $ace.FileSystemRights.ToString()
+                    WriteRights   = $matchedRights.ToString()
+                    Inherited     = $ace.IsInherited
+                })
+                $result.Writable = $true
             }
         }
 
@@ -232,16 +239,18 @@ function Test-UserCanWriteFolder ([string]$FolderPath) {
             if ($ace.AccessControlType -ne 'Allow') { continue }
             if (-not (Test-IdentityIsStandardUser $ace)) { continue }
 
-            foreach ($right in $script:DangerousFolderRights) {
-                if ($ace.FileSystemRights -band $right) {
-                    [void]$result.DangerousAces.Add([PSCustomObject]@{
-                        Identity  = $ace.IdentityReference.Value
-                        Rights    = $ace.FileSystemRights.ToString()
-                        Inherited = $ace.IsInherited
-                    })
-                    $result.Writable = $true
-                    break
-                }
+            # Check if any write-specific bits are set
+            if (([int]$ace.FileSystemRights -band $script:FolderWriteBitMask) -ne 0) {
+                $matchedRights = [System.Security.AccessControl.FileSystemRights](
+                    [int]$ace.FileSystemRights -band $script:FolderWriteBitMask
+                )
+                [void]$result.DangerousAces.Add([PSCustomObject]@{
+                    Identity    = $ace.IdentityReference.Value
+                    Rights      = $ace.FileSystemRights.ToString()
+                    WriteRights = $matchedRights.ToString()
+                    Inherited   = $ace.IsInherited
+                })
+                $result.Writable = $true
             }
         }
 
@@ -429,6 +438,9 @@ $securityConfigs   = [System.Collections.ArrayList]::new()
 $allowedExePaths   = [System.Collections.ArrayList]::new()
 $allowedExeFolders = [System.Collections.ArrayList]::new()
 
+# -- NEW: Collect ALL network/UNC paths (shares, mapped drives, DFS) --
+$allNetworkPaths   = [System.Collections.ArrayList]::new()
+
 # Regex to catch file paths ending in .exe, .com, .msi, .bat, .cmd, .ps1
 $exePathRegex = '(?i)([a-z]:\\[^<>"|\r\n*?]+\.(?:exe|com|msi|bat|cmd|ps1|vbs|wsf))'
 # Regex to catch folder-only paths (e.g. path-based allow rules)
@@ -438,6 +450,8 @@ $uncPathRegex = '(?i)(\\\\[^<>"|\r\n*?]+\.(?:exe|com|msi|bat|cmd|ps1|vbs|wsf))'
 $uncFolderRegex = '(?i)(\\\\[^<>"|\r\n*?]+\\)'
 # Regex for paths with environment variables
 $envPathRegex = '(?i)(%[a-z_()]+%\\[^<>"|\r\n*?]+)'
+# Broad regex to capture ANY UNC path (for network share inventory)
+$anyUncRegex = '(?i)(\\\\[a-z0-9_\-\.]+\\[^<>"|\r\n*?\s]+)'
 
 foreach ($xmlFile in $xmlFiles) {
     try {
@@ -549,6 +563,14 @@ foreach ($xmlFile in $xmlFiles) {
         }
         foreach ($match in [regex]::Matches($content, $envPathRegex)) {
             [void]$allowedExeFolders.Add($match.Value)
+        }
+
+        # 3) Collect ALL UNC/network paths for the network share inventory
+        foreach ($match in [regex]::Matches($content, $anyUncRegex)) {
+            [void]$allNetworkPaths.Add([PSCustomObject]@{
+                FullPath   = $match.Value.TrimEnd('\', '/')
+                ConfigFile = $xmlFile.Name
+            })
         }
 
         # --------------------------------------------------------------
@@ -681,6 +703,7 @@ foreach ($exeEntry in $uniqueExePaths) {
         foreach ($ace in $auditResult.DangerousAces) {
             $inhText = if ($ace.Inherited) { '(inherited)' } else { '(explicit)' }
             Write-Host "           -> $($ace.Identity): $($ace.Rights) $inhText" -ForegroundColor Yellow
+            Write-Host "              Write rights: $($ace.WriteRights)" -ForegroundColor Yellow
         }
     }
     if ($auditResult.Notes) {
@@ -720,6 +743,7 @@ foreach ($folder in $uniqueFolders) {
         foreach ($ace in $auditResult.DangerousAces) {
             $inhText = if ($ace.Inherited) { '(inherited)' } else { '(explicit)' }
             Write-Host "           -> $($ace.Identity): $($ace.Rights) $inhText" -ForegroundColor Yellow
+            Write-Host "              Write rights: $($ace.WriteRights)" -ForegroundColor Yellow
         }
     }
     if ($auditResult.Notes) {
@@ -759,6 +783,7 @@ if ($vulnerableFiles.Count -eq 0 -and $vulnerableFolders.Count -eq 0) {
             foreach ($ace in $vf.DangerousAces) {
                 $inhText = if ($ace.Inherited) { 'inherited' } else { 'EXPLICIT' }
                 Write-Host "           * $($ace.Identity)  ->  $($ace.Rights)  ($inhText)" -ForegroundColor Yellow
+                Write-Host "             Write rights: $($ace.WriteRights)" -ForegroundColor Yellow
             }
             if ($vf.Notes) { Write-Host "         Note: $($vf.Notes)" -ForegroundColor DarkGray }
             Write-Host ""
@@ -776,6 +801,7 @@ if ($vulnerableFiles.Count -eq 0 -and $vulnerableFolders.Count -eq 0) {
             foreach ($ace in $vd.DangerousAces) {
                 $inhText = if ($ace.Inherited) { 'inherited' } else { 'EXPLICIT' }
                 Write-Host "           * $($ace.Identity)  ->  $($ace.Rights)  ($inhText)" -ForegroundColor Yellow
+                Write-Host "             Write rights: $($ace.WriteRights)" -ForegroundColor Yellow
             }
             if ($vd.Notes) { Write-Host "         Note: $($vd.Notes)" -ForegroundColor DarkGray }
             Write-Host ""
@@ -796,6 +822,337 @@ if ($vulnerableFiles.Count -eq 0 -and $vulnerableFolders.Count -eq 0) {
     Write-Host "      * Enable certificate-based whitelisting for additional protection" -ForegroundColor Gray
     Write-Host ""
 }
+
+# ==============================================================================
+# -- Network Share Discovery & Accessibility Audit ----------------------------
+# ==============================================================================
+
+Write-Section 'Network Share Discovery & Accessibility'
+
+# Also collect UNC paths from the exe/folder lists already found
+foreach ($ep in $allowedExePaths) {
+    $p = $ep.Path
+    if ($p -match '^\\\\') {
+        [void]$allNetworkPaths.Add([PSCustomObject]@{
+            FullPath   = $p.TrimEnd('\', '/')
+            ConfigFile = $ep.ConfigFile
+        })
+    }
+}
+foreach ($fp in $allowedExeFolders) {
+    if ($fp -match '^\\\\') {
+        [void]$allNetworkPaths.Add([PSCustomObject]@{
+            FullPath   = $fp.TrimEnd('\', '/')
+            ConfigFile = '(folder scan)'
+        })
+    }
+}
+foreach ($uf in $uniqueFolders) {
+    if ($uf -match '^\\\\') {
+        [void]$allNetworkPaths.Add([PSCustomObject]@{
+            FullPath   = $uf.TrimEnd('\', '/')
+            ConfigFile = '(folder scan)'
+        })
+    }
+}
+
+# Extract unique share roots (\\server\share) from all collected UNC paths
+function Get-ShareRoot ([string]$UncPath) {
+    <# Extracts \\server\share from a longer UNC path #>
+    if ($UncPath -match '^(\\\\[^\\]+\\[^\\]+)') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Get-ServerName ([string]$UncPath) {
+    <# Extracts the server name from a UNC path #>
+    if ($UncPath -match '^\\\\([^\\]+)') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+# Build unique lists
+$uniqueFullUncPaths = $allNetworkPaths | ForEach-Object { $_.FullPath } | Sort-Object -Unique
+$uniqueShareRoots   = $uniqueFullUncPaths | ForEach-Object { Get-ShareRoot $_ } |
+    Where-Object { $_ } | Sort-Object -Unique
+$uniqueServers      = $uniqueFullUncPaths | ForEach-Object { Get-ServerName $_ } |
+    Where-Object { $_ } | Sort-Object -Unique
+
+# Build a lookup: share root -> list of full paths that reference it
+$sharePathMap = @{}
+foreach ($fp in $uniqueFullUncPaths) {
+    $root = Get-ShareRoot $fp
+    if ($root) {
+        if (-not $sharePathMap.ContainsKey($root)) {
+            $sharePathMap[$root] = [System.Collections.ArrayList]::new()
+        }
+        if ($fp -ne $root) {
+            [void]$sharePathMap[$root].Add($fp)
+        }
+    }
+}
+
+# Build a lookup: share root -> config files that reference it
+$shareConfigMap = @{}
+foreach ($np in $allNetworkPaths) {
+    $root = Get-ShareRoot $np.FullPath
+    if ($root) {
+        if (-not $shareConfigMap.ContainsKey($root)) {
+            $shareConfigMap[$root] = [System.Collections.ArrayList]::new()
+        }
+        if ($np.ConfigFile -and $np.ConfigFile -notin $shareConfigMap[$root]) {
+            [void]$shareConfigMap[$root].Add($np.ConfigFile)
+        }
+    }
+}
+
+Write-Host "  Unique UNC paths found:    $($uniqueFullUncPaths.Count)"
+Write-Host "  Unique share roots:        $($uniqueShareRoots.Count)"
+Write-Host "  Unique servers referenced: $($uniqueServers.Count)"
+
+# -- Test server reachability & share accessibility ---
+
+Write-SubSection "Server Reachability"
+
+$serverResults = [System.Collections.ArrayList]::new()
+$counter = 0
+foreach ($server in $uniqueServers) {
+    $counter++
+    Write-Progress -Activity 'Testing server reachability' -Status $server -PercentComplete (($counter / [Math]::Max($uniqueServers.Count,1)) * 100)
+
+    $reachable = $false
+    $method    = ''
+
+    # Try TCP 445 (SMB) first with a short timeout
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $connect = $tcp.BeginConnect($server, 445, $null, $null)
+        $waited = $connect.AsyncWaitHandle.WaitOne(2000, $false)
+        if ($waited -and $tcp.Connected) {
+            $reachable = $true
+            $method = 'TCP/445 (SMB)'
+        }
+        $tcp.Close()
+    } catch { }
+
+    # Fallback: ping
+    if (-not $reachable) {
+        try {
+            $ping = Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue
+            if ($ping) {
+                $reachable = $true
+                $method = 'ICMP Ping'
+            }
+        } catch { }
+    }
+
+    # Fallback: DNS resolution only
+    if (-not $reachable) {
+        try {
+            $dns = [System.Net.Dns]::GetHostEntry($server)
+            if ($dns.AddressList.Count -gt 0) {
+                $method = 'DNS resolves but not reachable on 445/ICMP'
+            } else {
+                $method = 'DNS resolution failed'
+            }
+        } catch {
+            $method = 'DNS resolution failed'
+        }
+    }
+
+    $colour = if ($reachable) { 'Green' } else { 'Red' }
+    $icon   = if ($reachable) { '[OK]' } else { '[!!]' }
+    Write-Host "    $icon $server -- $method" -ForegroundColor $colour
+
+    [void]$serverResults.Add([PSCustomObject]@{
+        Server    = $server
+        Reachable = $reachable
+        Method    = $method
+    })
+}
+Write-Progress -Activity 'Testing server reachability' -Completed
+
+# -- Test each share root for accessibility ---
+
+Write-SubSection "Share Accessibility ($($uniqueShareRoots.Count) shares)"
+
+$accessibleShares   = [System.Collections.ArrayList]::new()
+$inaccessibleShares = [System.Collections.ArrayList]::new()
+
+$counter = 0
+foreach ($shareRoot in $uniqueShareRoots) {
+    $counter++
+    Write-Progress -Activity 'Testing share accessibility' -Status $shareRoot -PercentComplete (($counter / [Math]::Max($uniqueShareRoots.Count,1)) * 100)
+
+    $server     = Get-ServerName $shareRoot
+    $accessible = $false
+    $canList    = $false
+    $userWrite  = $false
+    $owner      = ''
+    $errMsg     = ''
+    $subPaths   = if ($sharePathMap.ContainsKey($shareRoot)) { $sharePathMap[$shareRoot] } else { @() }
+    $configs    = if ($shareConfigMap.ContainsKey($shareRoot)) { ($shareConfigMap[$shareRoot] -join ', ') } else { '' }
+
+    # Check if the share root is accessible
+    try {
+        if (Test-Path -LiteralPath $shareRoot -ErrorAction Stop) {
+            $accessible = $true
+
+            # Can we list contents?
+            try {
+                $listing = Get-ChildItem -LiteralPath $shareRoot -ErrorAction Stop | Select-Object -First 1
+                $canList = $true
+            } catch {
+                $canList = $false
+            }
+
+            # Check write permissions for standard users
+            try {
+                $acl = Get-Acl -LiteralPath $shareRoot -ErrorAction Stop
+                $owner = $acl.Owner
+                foreach ($ace in $acl.Access) {
+                    if ($ace.AccessControlType -ne 'Allow') { continue }
+                    # Check if identity is a standard user group
+                    $isUser = $false
+                    foreach ($name in $script:UserWriteNames) {
+                        if ($ace.IdentityReference.Value -like "*$name*") { $isUser = $true; break }
+                    }
+                    if (-not $isUser) {
+                        try {
+                            $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                            if ($sid -in $script:UserWriteSIDs) { $isUser = $true }
+                        } catch { }
+                    }
+                    if ($isUser) {
+                        if (([int]$ace.FileSystemRights -band $script:FolderWriteBitMask) -ne 0) {
+                            $userWrite = $true
+                        }
+                    }
+                    if ($userWrite) { break }
+                }
+            } catch {
+                $errMsg = "ACL check failed: $_"
+            }
+        } else {
+            $errMsg = 'Path not accessible (Test-Path returned false)'
+        }
+    } catch {
+        $errMsg = "Access error: $_"
+    }
+
+    # Build result object
+    $shareResult = [PSCustomObject]@{
+        ShareRoot       = $shareRoot
+        Server          = $server
+        Accessible      = $accessible
+        CanListContents = $canList
+        UserWritable    = $userWrite
+        Owner           = $owner
+        SubPathsFound   = $subPaths.Count
+        ConfigFiles     = $configs
+        Error           = $errMsg
+    }
+
+    if ($accessible) {
+        [void]$accessibleShares.Add($shareResult)
+    } else {
+        [void]$inaccessibleShares.Add($shareResult)
+    }
+
+    # Display
+    if ($accessible) {
+        $writeWarn = if ($userWrite) { ' ** USER-WRITABLE **' } else { '' }
+        $colour    = if ($userWrite) { 'Yellow' } else { 'Green' }
+        Write-Host "    [OK] $shareRoot" -ForegroundColor $colour
+        Write-Host "         Accessible: Yes  |  Can list: $canList  |  Owner: $owner$writeWarn" -ForegroundColor DarkGray
+    } else {
+        Write-Host "    [!!] $shareRoot" -ForegroundColor Red
+        Write-Host "         Accessible: No   |  Error: $errMsg" -ForegroundColor DarkGray
+    }
+
+    if ($subPaths.Count -gt 0) {
+        Write-Host "         Sub-paths referencing this share:" -ForegroundColor DarkGray
+        foreach ($sp in $subPaths) {
+            Write-Host "           - $sp" -ForegroundColor DarkGray
+        }
+    }
+    if ($configs) {
+        Write-Host "         Referenced in: $configs" -ForegroundColor DarkGray
+    }
+}
+Write-Progress -Activity 'Testing share accessibility' -Completed
+
+# -- Summary tables ---
+
+Write-SubSection "Accessible Shares ($($accessibleShares.Count))"
+if ($accessibleShares.Count -gt 0) {
+    foreach ($s in $accessibleShares) {
+        $writeFlag = if ($s.UserWritable) { ' [USER-WRITABLE]' } else { '' }
+        $colour    = if ($s.UserWritable) { 'Yellow' } else { 'Green' }
+        Write-Host "    $($s.ShareRoot)$writeFlag" -ForegroundColor $colour
+    }
+} else {
+    Write-Host "    None" -ForegroundColor DarkGray
+}
+
+Write-SubSection "Inaccessible Shares ($($inaccessibleShares.Count))"
+if ($inaccessibleShares.Count -gt 0) {
+    foreach ($s in $inaccessibleShares) {
+        Write-Host "    $($s.ShareRoot)" -ForegroundColor Red
+        Write-Host "      Error: $($s.Error)" -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "    None -- all shares were accessible" -ForegroundColor Green
+}
+
+# -- Also test full sub-paths on accessible shares ---
+
+Write-SubSection "Full Path Accessibility (sub-paths on accessible shares)"
+
+$subPathResults = [System.Collections.ArrayList]::new()
+$allSubPaths = $sharePathMap.Values | ForEach-Object { $_ } | Sort-Object -Unique
+
+$counter = 0
+foreach ($sp in $allSubPaths) {
+    $counter++
+    Write-Progress -Activity 'Testing sub-path accessibility' -Status $sp -PercentComplete (($counter / [Math]::Max($allSubPaths.Count,1)) * 100)
+
+    $spAccessible = $false
+    $spIsFile     = $false
+    $spIsFolder   = $false
+    $spError      = ''
+
+    try {
+        if (Test-Path -LiteralPath $sp -PathType Leaf -ErrorAction Stop) {
+            $spAccessible = $true
+            $spIsFile     = $true
+        } elseif (Test-Path -LiteralPath $sp -PathType Container -ErrorAction Stop) {
+            $spAccessible = $true
+            $spIsFolder   = $true
+        } else {
+            $spError = 'Path does not exist'
+        }
+    } catch {
+        $spError = "$_"
+    }
+
+    $spType = if ($spIsFile) { 'File' } elseif ($spIsFolder) { 'Folder' } else { 'N/A' }
+
+    [void]$subPathResults.Add([PSCustomObject]@{
+        Path       = $sp
+        Accessible = $spAccessible
+        Type       = $spType
+        Error      = $spError
+    })
+
+    $colour = if ($spAccessible) { 'Green' } else { 'Red' }
+    $icon   = if ($spAccessible) { '[OK]' } else { '[!!]' }
+    Write-Host "    $icon $sp ($spType)" -ForegroundColor $colour
+    if ($spError) { Write-Host "         Error: $spError" -ForegroundColor DarkGray }
+}
+Write-Progress -Activity 'Testing sub-path accessibility' -Completed
 
 # ==============================================================================
 # -- Display: Original Security Rule Results ----------------------------------
@@ -903,8 +1260,9 @@ if ($ExportCsv) {
     if ($fileAuditResults.Count -gt 0) {
         $faFile = Join-Path $OutputPath 'AuditResults_Files.csv'
         $fileAuditResults | Select-Object Path, Type, Exists, Writable, Risk, Owner, Notes,
-            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity }) -join '; ' }},
-            @{N='DangerousRights';     E={ ($_.DangerousAces | ForEach-Object { $_.Rights })   -join '; ' }},
+            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+            @{N='FullRights';          E={ ($_.DangerousAces | ForEach-Object { $_.Rights })      -join '; ' }},
+            @{N='WriteRightsOnly';     E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
             @{N='ConfigFile'; E={ $_.ConfigFile }} |
             Export-Csv -Path $faFile -NoTypeInformation
         Write-Host "  File audit results    -> $faFile" -ForegroundColor Green
@@ -913,8 +1271,9 @@ if ($ExportCsv) {
     if ($folderAuditResults.Count -gt 0) {
         $daFile = Join-Path $OutputPath 'AuditResults_Folders.csv'
         $folderAuditResults | Select-Object Path, Type, Exists, Writable, Risk, Owner, Notes,
-            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity }) -join '; ' }},
-            @{N='DangerousRights';     E={ ($_.DangerousAces | ForEach-Object { $_.Rights })   -join '; ' }} |
+            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+            @{N='FullRights';          E={ ($_.DangerousAces | ForEach-Object { $_.Rights })      -join '; ' }},
+            @{N='WriteRightsOnly';     E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }} |
             Export-Csv -Path $daFile -NoTypeInformation
         Write-Host "  Folder audit results  -> $daFile" -ForegroundColor Green
     }
@@ -923,12 +1282,14 @@ if ($ExportCsv) {
         $vulnFile = Join-Path $OutputPath 'VULNERABILITIES.csv'
         $allVulns = @()
         $allVulns += $vulnerableFiles  | Select-Object Path, Type, Risk, Owner,
-            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity }) -join '; ' }},
-            @{N='DangerousRights';     E={ ($_.DangerousAces | ForEach-Object { $_.Rights })   -join '; ' }},
+            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+            @{N='FullRights';          E={ ($_.DangerousAces | ForEach-Object { $_.Rights })      -join '; ' }},
+            @{N='WriteRightsOnly';     E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
             Notes
         $allVulns += $vulnerableFolders | Select-Object Path, Type, Risk, Owner,
-            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity }) -join '; ' }},
-            @{N='DangerousRights';     E={ ($_.DangerousAces | ForEach-Object { $_.Rights })   -join '; ' }},
+            @{N='DangerousIdentities'; E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+            @{N='FullRights';          E={ ($_.DangerousAces | ForEach-Object { $_.Rights })      -join '; ' }},
+            @{N='WriteRightsOnly';     E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
             Notes
         $allVulns | Export-Csv -Path $vulnFile -NoTypeInformation
         Write-Host "  ** VULNERABILITIES ** -> $vulnFile" -ForegroundColor Red
@@ -944,6 +1305,41 @@ if ($ExportCsv) {
         $acFile = Join-Path $OutputPath 'AuthorizedCerts.csv'
         $authorizedCerts | Export-Csv -Path $acFile -NoTypeInformation
         Write-Host "  Authorized certs      -> $acFile" -ForegroundColor Green
+    }
+
+    # Network share reports
+    if ($accessibleShares.Count -gt 0) {
+        $asFile = Join-Path $OutputPath 'NetworkShares_Accessible.csv'
+        $accessibleShares | Export-Csv -Path $asFile -NoTypeInformation
+        Write-Host "  Accessible shares     -> $asFile" -ForegroundColor Green
+    }
+
+    if ($inaccessibleShares.Count -gt 0) {
+        $isFile = Join-Path $OutputPath 'NetworkShares_Inaccessible.csv'
+        $inaccessibleShares | Export-Csv -Path $isFile -NoTypeInformation
+        Write-Host "  Inaccessible shares   -> $isFile" -ForegroundColor Red
+    }
+
+    if ($serverResults.Count -gt 0) {
+        $srFile = Join-Path $OutputPath 'NetworkServers.csv'
+        $serverResults | Export-Csv -Path $srFile -NoTypeInformation
+        Write-Host "  Server reachability   -> $srFile" -ForegroundColor Green
+    }
+
+    if ($subPathResults.Count -gt 0) {
+        $spFile = Join-Path $OutputPath 'NetworkSubPaths.csv'
+        $subPathResults | Export-Csv -Path $spFile -NoTypeInformation
+        Write-Host "  Network sub-paths     -> $spFile" -ForegroundColor Green
+    }
+
+    # Combined full inventory
+    $allShareInventory = @()
+    $allShareInventory += $accessibleShares   | Select-Object ShareRoot, Server, Accessible, CanListContents, UserWritable, Owner, SubPathsFound, ConfigFiles, Error
+    $allShareInventory += $inaccessibleShares | Select-Object ShareRoot, Server, Accessible, CanListContents, UserWritable, Owner, SubPathsFound, ConfigFiles, Error
+    if ($allShareInventory.Count -gt 0) {
+        $invFile = Join-Path $OutputPath 'NetworkShares_FullInventory.csv'
+        $allShareInventory | Export-Csv -Path $invFile -NoTypeInformation
+        Write-Host "  Full share inventory  -> $invFile" -ForegroundColor Cyan
     }
 
     Write-Host "`n  Export complete." -ForegroundColor Cyan
@@ -968,6 +1364,19 @@ Write-Host "  |  Writable EXE files:      $($vulnerableFiles.Count)" -Foreground
 Write-Host "  |  Writable folders:        $($vulnerableFolders.Count)" -ForegroundColor $vulnColour
 Write-Host "  |  TOTAL VULNERABILITIES:   $($vulnerableFiles.Count + $vulnerableFolders.Count)" -ForegroundColor $vulnColour
 Write-Host "  +--------------------------------------------------------" -ForegroundColor $vulnColour
+Write-Host ""
+
+$netColour = if ($inaccessibleShares.Count -gt 0) { 'Yellow' } else { 'Green' }
+$writeColour = if (($accessibleShares | Where-Object { $_.UserWritable }).Count -gt 0) { 'Red' } else { 'Green' }
+Write-Host "  +- Network Share Audit ----------------------------------" -ForegroundColor $netColour
+Write-Host "  |  Servers referenced:      $($uniqueServers.Count)" -ForegroundColor White
+Write-Host "  |  Servers reachable:       $(($serverResults | Where-Object { $_.Reachable }).Count)" -ForegroundColor White
+Write-Host "  |  Servers unreachable:     $(($serverResults | Where-Object { -not $_.Reachable }).Count)" -ForegroundColor $netColour
+Write-Host "  |  Share roots found:       $($uniqueShareRoots.Count)" -ForegroundColor White
+Write-Host "  |  Shares accessible:       $($accessibleShares.Count)" -ForegroundColor Green
+Write-Host "  |  Shares inaccessible:     $($inaccessibleShares.Count)" -ForegroundColor $netColour
+Write-Host "  |  Shares user-writable:    $(($accessibleShares | Where-Object { $_.UserWritable }).Count)" -ForegroundColor $writeColour
+Write-Host "  +--------------------------------------------------------" -ForegroundColor $netColour
 Write-Host ""
 Write-Host "  Authorized file rules:   $($authorizedFiles.Count)"
 Write-Host "  Authorized cert rules:   $($authorizedCerts.Count)"
