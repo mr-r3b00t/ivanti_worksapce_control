@@ -28,12 +28,13 @@
 .NOTES
     Must be run as Administrator to access Program Files cache and HKLM registry keys.
     Author:  Generated for IWC enumeration
-    Version: 3.0
+    Version: 4.0
 #>
 
 [CmdletBinding()]
 param(
     [switch]$ExportCsv,
+    [switch]$ExportHtml,
     [string]$OutputPath = "$env:USERPROFILE\Desktop\IWC_AllowList_Report"
 )
 
@@ -1345,6 +1346,443 @@ if ($ExportCsv) {
     Write-Host "`n  Export complete." -ForegroundColor Cyan
 }
 
+# -- 6. HTML Report (optional) ------------------------------------------------
+
+if ($ExportHtml) {
+    Write-Section 'Generating HTML Report'
+
+    if (-not (Test-Path $OutputPath)) {
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+    }
+
+    $reportDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $hostName   = $env:COMPUTERNAME
+    $userName   = "$env:USERDOMAIN\$env:USERNAME"
+
+    $totalVulns         = $vulnerableFiles.Count + $vulnerableFolders.Count
+    $reachableServers   = ($serverResults | Where-Object { $_.Reachable }).Count
+    $unreachableServers = ($serverResults | Where-Object { -not $_.Reachable }).Count
+    $writableShareCount = ($accessibleShares | Where-Object { $_.UserWritable }).Count
+
+    # -- Helper: build an HTML table from an array of objects
+    function ConvertTo-HtmlTable {
+        param(
+            [Parameter(Mandatory)][array]$Data,
+            [string[]]$Columns,
+            [string]$HighlightColumn = '',
+            [string]$HighlightValue  = '',
+            [string]$HighlightClass  = 'risk-high'
+        )
+        if ($Data.Count -eq 0) { return '<p class="muted">None found.</p>' }
+        if (-not $Columns) { $Columns = $Data[0].PSObject.Properties.Name }
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.Append('<table><thead><tr>')
+        foreach ($col in $Columns) {
+            [void]$sb.Append("<th>$col</th>")
+        }
+        [void]$sb.Append('</tr></thead><tbody>')
+        foreach ($row in $Data) {
+            $rowClass = ''
+            if ($HighlightColumn -and $row.$HighlightColumn -eq $HighlightValue) {
+                $rowClass = " class=`"$HighlightClass`""
+            }
+            [void]$sb.Append("<tr$rowClass>")
+            foreach ($col in $Columns) {
+                $val = $row.$col
+                if ($null -eq $val) { $val = '' }
+                $val = [System.Web.HttpUtility]::HtmlEncode("$val")
+                [void]$sb.Append("<td>$val</td>")
+            }
+            [void]$sb.Append('</tr>')
+        }
+        [void]$sb.Append('</tbody></table>')
+        return $sb.ToString()
+    }
+
+    # -- Build flat data for HTML tables
+    $fileAuditFlat = $fileAuditResults | Select-Object Path, Exists, Writable, Risk, Owner,
+        @{N='Identity';    E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+        @{N='FullRights';  E={ ($_.DangerousAces | ForEach-Object { $_.Rights })      -join '; ' }},
+        @{N='WriteRights'; E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
+        Notes
+
+    $folderAuditFlat = $folderAuditResults | Select-Object Path, Exists, Writable, Risk, Owner,
+        @{N='Identity';    E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+        @{N='FullRights';  E={ ($_.DangerousAces | ForEach-Object { $_.Rights })      -join '; ' }},
+        @{N='WriteRights'; E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
+        Notes
+
+    $vulnFlat = @()
+    $vulnFlat += $vulnerableFiles | Select-Object Path,
+        @{N='Type'; E={ 'File' }}, Risk, Owner,
+        @{N='Identity';    E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+        @{N='WriteRights'; E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
+        Notes
+    $vulnFlat += $vulnerableFolders | Select-Object Path,
+        @{N='Type'; E={ 'Folder' }}, Risk, Owner,
+        @{N='Identity';    E={ ($_.DangerousAces | ForEach-Object { $_.Identity })    -join '; ' }},
+        @{N='WriteRights'; E={ ($_.DangerousAces | ForEach-Object { $_.WriteRights }) -join '; ' }},
+        Notes
+
+    $regFlat = $registryFindings | Select-Object RegistryKey, Name, Value, SecurityRelated
+
+    $shareAllFlat = @()
+    $shareAllFlat += $accessibleShares   | Select-Object ShareRoot, Server, Accessible, CanListContents, UserWritable, Owner, SubPathsFound, ConfigFiles, Error
+    $shareAllFlat += $inaccessibleShares | Select-Object ShareRoot, Server, Accessible, CanListContents, UserWritable, Owner, SubPathsFound, ConfigFiles, Error
+
+    # Ensure System.Web is loaded for HtmlEncode
+    Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+
+    # -- Compose HTML
+    $htmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IWC Allow List Audit Report - $hostName</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e0e0e8;
+    --muted: #8888a0;
+    --accent: #5b8af5;
+    --green: #3ddc84;
+    --red: #f44;
+    --yellow: #ffc107;
+    --orange: #ff9800;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    line-height: 1.5;
+  }
+  h1 { font-size: 22px; color: var(--accent); margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 12px; margin-bottom: 24px; }
+  h2 {
+    font-size: 16px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+    margin: 28px 0 12px 0;
+  }
+  h3 { font-size: 14px; color: var(--text); margin: 16px 0 8px 0; }
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .card-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .card-value { font-size: 28px; font-weight: bold; }
+  .card-value.ok    { color: var(--green); }
+  .card-value.warn  { color: var(--yellow); }
+  .card-value.danger { color: var(--red); }
+  .card-detail { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: bold;
+  }
+  .badge-ok     { background: #1b3a2a; color: var(--green); }
+  .badge-warn   { background: #3a3320; color: var(--yellow); }
+  .badge-danger { background: #3a1a1a; color: var(--red); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0 16px 0;
+    font-size: 12px;
+  }
+  th {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    position: sticky;
+    top: 0;
+  }
+  td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    word-break: break-all;
+    max-width: 400px;
+  }
+  tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+  tr:hover { background: rgba(91,138,245,0.08); }
+  tr.risk-high { background: rgba(255,68,68,0.1); }
+  tr.risk-high:hover { background: rgba(255,68,68,0.18); }
+  .muted { color: var(--muted); font-style: italic; }
+  .toc { margin: 16px 0 24px 0; }
+  .toc a { color: var(--accent); text-decoration: none; margin-right: 16px; }
+  .toc a:hover { text-decoration: underline; }
+  .alert-box {
+    border: 2px solid var(--red);
+    background: rgba(255,68,68,0.08);
+    border-radius: 6px;
+    padding: 16px;
+    margin: 16px 0;
+  }
+  .alert-box.ok {
+    border-color: var(--green);
+    background: rgba(61,220,132,0.08);
+  }
+  .alert-title { font-size: 14px; font-weight: bold; margin-bottom: 8px; }
+  .remediation { background: var(--surface); border-radius: 6px; padding: 16px; margin: 12px 0; }
+  .remediation li { margin: 4px 0; color: var(--text); }
+  footer { margin-top: 32px; padding-top: 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>Ivanti Workspace Control -- Allow List Audit Report</h1>
+<div class="subtitle">
+  Host: $hostName | User: $userName | Generated: $reportDate
+</div>
+
+<div class="toc">
+  <a href="#summary">Summary</a>
+  <a href="#vulns">Vulnerabilities</a>
+  <a href="#file-audit">File Audit</a>
+  <a href="#folder-audit">Folder Audit</a>
+  <a href="#network">Network Shares</a>
+  <a href="#registry">Registry</a>
+  <a href="#security-rules">Security Rules</a>
+  <a href="#components">Components</a>
+</div>
+
+<!-- ====== SUMMARY ====== -->
+<h2 id="summary">Executive Summary</h2>
+<div class="summary-grid">
+  <div class="card">
+    <div class="card-title">Total Vulnerabilities</div>
+    <div class="card-value $(if ($totalVulns -gt 0) { 'danger' } else { 'ok' })">$totalVulns</div>
+    <div class="card-detail">$($vulnerableFiles.Count) files / $($vulnerableFolders.Count) folders writable by standard users</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Allowed Executables</div>
+    <div class="card-value">$($uniqueExePaths.Count)</div>
+    <div class="card-detail">$($uniqueFolders.Count) unique folders</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Network Shares</div>
+    <div class="card-value $(if ($inaccessibleShares.Count -gt 0) { 'warn' } else { 'ok' })">$($uniqueShareRoots.Count)</div>
+    <div class="card-detail">$($accessibleShares.Count) accessible / $($inaccessibleShares.Count) inaccessible / $writableShareCount user-writable</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Servers Referenced</div>
+    <div class="card-value $(if ($unreachableServers -gt 0) { 'warn' } else { 'ok' })">$($uniqueServers.Count)</div>
+    <div class="card-detail">$reachableServers reachable / $unreachableServers unreachable</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Cache Location</div>
+    <div class="card-value" style="font-size:13px;">$([System.Web.HttpUtility]::HtmlEncode($cachePath))</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Configuration Objects</div>
+    <div class="card-value">$($xmlFiles.Count)</div>
+    <div class="card-detail">$($registryFindings.Count) registry values</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Security Rules</div>
+    <div class="card-value">$(($authorizedFiles.Count + $authorizedCerts.Count + $authorizedOwners.Count))</div>
+    <div class="card-detail">$($authorizedFiles.Count) file / $($authorizedCerts.Count) cert / $($authorizedOwners.Count) owner rules</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Blocked Path Rules</div>
+    <div class="card-value">$($blockedPaths.Count)</div>
+    <div class="card-detail">$($securityConfigs.Count) security config entries</div>
+  </div>
+</div>
+
+<!-- ====== VULNERABILITIES ====== -->
+<h2 id="vulns">Vulnerability Report</h2>
+"@
+
+    if ($totalVulns -eq 0) {
+        $htmlContent += @"
+
+<div class="alert-box ok">
+  <div class="alert-title">[OK] No Vulnerabilities Found</div>
+  All allowed executable paths and folders appear to be protected from standard user write access.
+</div>
+"@
+    } else {
+        $htmlContent += @"
+
+<div class="alert-box">
+  <div class="alert-title">[!] $totalVulns Vulnerable Path(s) Found</div>
+  A standard user could potentially overwrite or plant executables in the following allowed paths.
+</div>
+"@
+        $htmlContent += (ConvertTo-HtmlTable -Data $vulnFlat -Columns @('Path','Type','Risk','Owner','Identity','WriteRights','Notes') -HighlightColumn 'Type' -HighlightValue '' -HighlightClass '')
+
+        $htmlContent += @"
+
+<div class="remediation">
+  <h3>Remediation Guidance</h3>
+  <ul>
+    <li>Remove Write/Modify permissions for Users, Everyone, Authenticated Users on flagged paths</li>
+    <li>Ensure file owners are SYSTEM, TrustedInstaller, or Administrators</li>
+    <li>Use file hash or certificate-based rules instead of path-based allow rules</li>
+    <li>Enable Authorized Owners to require NTFS owner = admin</li>
+    <li>Remove CreateFiles/Write for standard user groups on flagged folders</li>
+  </ul>
+</div>
+"@
+    }
+
+    # -- File Audit
+    $htmlContent += @"
+
+<h2 id="file-audit">File Permission Audit ($($fileAuditResults.Count) paths)</h2>
+"@
+    $htmlContent += (ConvertTo-HtmlTable -Data $fileAuditFlat -Columns @('Path','Exists','Writable','Risk','Owner','Identity','FullRights','WriteRights','Notes') -HighlightColumn 'Writable' -HighlightValue 'True' -HighlightClass 'risk-high')
+
+    # -- Folder Audit
+    $htmlContent += @"
+
+<h2 id="folder-audit">Folder Permission Audit ($($folderAuditResults.Count) folders)</h2>
+"@
+    $htmlContent += (ConvertTo-HtmlTable -Data $folderAuditFlat -Columns @('Path','Exists','Writable','Risk','Owner','Identity','FullRights','WriteRights','Notes') -HighlightColumn 'Writable' -HighlightValue 'True' -HighlightClass 'risk-high')
+
+    # -- Network Shares
+    $htmlContent += @"
+
+<h2 id="network">Network Share Audit</h2>
+<h3>Server Reachability ($($uniqueServers.Count) servers)</h3>
+"@
+    $htmlContent += (ConvertTo-HtmlTable -Data $serverResults -Columns @('Server','Reachable','Method') -HighlightColumn 'Reachable' -HighlightValue 'False' -HighlightClass 'risk-high')
+
+    $htmlContent += '<h3>Accessible Shares (' + $accessibleShares.Count + ')</h3>'
+    if ($accessibleShares.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data $accessibleShares -Columns @('ShareRoot','Server','Accessible','CanListContents','UserWritable','Owner','SubPathsFound','ConfigFiles') -HighlightColumn 'UserWritable' -HighlightValue 'True' -HighlightClass 'risk-high')
+    } else {
+        $htmlContent += '<p class="muted">No accessible shares found.</p>'
+    }
+
+    $htmlContent += '<h3>Inaccessible Shares (' + $inaccessibleShares.Count + ')</h3>'
+    if ($inaccessibleShares.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data $inaccessibleShares -Columns @('ShareRoot','Server','Error','ConfigFiles') -HighlightColumn '' -HighlightValue '' -HighlightClass 'risk-high')
+    } else {
+        $htmlContent += '<p class="muted">All shares were accessible.</p>'
+    }
+
+    if ($subPathResults.Count -gt 0) {
+        $htmlContent += '<h3>Sub-Path Accessibility (' + $subPathResults.Count + ')</h3>'
+        $htmlContent += (ConvertTo-HtmlTable -Data $subPathResults -Columns @('Path','Accessible','Type','Error') -HighlightColumn 'Accessible' -HighlightValue 'False' -HighlightClass 'risk-high')
+    }
+
+    # -- Registry
+    $htmlContent += @"
+
+<h2 id="registry">Registry Security Settings ($($registryFindings.Count) values)</h2>
+"@
+    if ($regFlat.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data $regFlat -Columns @('RegistryKey','Name','Value','SecurityRelated') -HighlightColumn 'SecurityRelated' -HighlightValue 'True' -HighlightClass '')
+    } else {
+        $htmlContent += '<p class="muted">No registry settings found.</p>'
+    }
+
+    # -- Security Rules
+    $htmlContent += @"
+
+<h2 id="security-rules">Security Rules Detail</h2>
+<h3>Authorized Files / Hashes ($($authorizedFiles.Count))</h3>
+"@
+    if ($authorizedFiles.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data ($authorizedFiles | Select-Object SourceFile, NodeName))
+    } else {
+        $htmlContent += '<p class="muted">None found in local cache.</p>'
+    }
+
+    $htmlContent += '<h3>Authorized Certificates (' + $authorizedCerts.Count + ')</h3>'
+    if ($authorizedCerts.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data ($authorizedCerts | Select-Object SourceFile, NodeName, Publisher, Product))
+    } else {
+        $htmlContent += '<p class="muted">None found in local cache.</p>'
+    }
+
+    $htmlContent += '<h3>Authorized Owners (' + $authorizedOwners.Count + ')</h3>'
+    if ($authorizedOwners.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data $authorizedOwners)
+    } else {
+        $htmlContent += '<p class="muted">None found in local cache.</p>'
+    }
+
+    $htmlContent += '<h3>Blocked Paths (' + $blockedPaths.Count + ')</h3>'
+    if ($blockedPaths.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data $blockedPaths)
+    } else {
+        $htmlContent += '<p class="muted">None found in local cache.</p>'
+    }
+
+    # -- Components
+    $htmlContent += @"
+
+<h2 id="components">Installed Components</h2>
+"@
+    $componentData = @()
+    foreach ($iwcPath in $iwcInstallPaths) {
+        if (Test-Path $iwcPath) {
+            Get-ChildItem -Path $iwcPath -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object {
+                $componentData += [PSCustomObject]@{
+                    Path    = $_.FullName
+                    Name    = $_.Name
+                    Version = $_.VersionInfo.ProductVersion
+                }
+            }
+        }
+    }
+    if ($componentData.Count -gt 0) {
+        $htmlContent += (ConvertTo-HtmlTable -Data $componentData -Columns @('Name','Version','Path'))
+    } else {
+        $htmlContent += '<p class="muted">No IWC executables found.</p>'
+    }
+
+    # -- Footer
+    $htmlContent += @"
+
+<footer>
+  Ivanti Workspace Control Allow List Audit Report v4.0<br>
+  Generated on $hostName by $userName at $reportDate<br>
+  This report was generated by Get-IWCAllowListConfig.ps1
+</footer>
+</body>
+</html>
+"@
+
+    # Write file
+    $htmlFile = Join-Path $OutputPath 'IWC_AllowList_AuditReport.html'
+    $htmlContent | Out-File -FilePath $htmlFile -Encoding ascii -Force
+    Write-Host "  HTML report -> $htmlFile" -ForegroundColor Green
+    Write-Host ""
+
+    # Auto-open in default browser
+    try {
+        Start-Process $htmlFile -ErrorAction SilentlyContinue
+        Write-Host "  Report opened in default browser." -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  Could not auto-open report. Open manually: $htmlFile" -ForegroundColor DarkGray
+    }
+}
+
 # -- Summary ------------------------------------------------------------------
 
 Write-Section 'Summary'
@@ -1384,6 +1822,7 @@ Write-Host "  Authorized owner rules:  $($authorizedOwners.Count)"
 Write-Host "  Blocked path rules:      $($blockedPaths.Count)"
 Write-Host "  Security config entries: $($securityConfigs.Count)"
 Write-Host ""
-Write-Host "  Tip: Run with -ExportCsv to save results to CSV files." -ForegroundColor DarkGray
-Write-Host "       e.g. .\Get-IWCAllowListConfig.ps1 -ExportCsv" -ForegroundColor DarkGray
+Write-Host "  Tip: Run with -ExportCsv and/or -ExportHtml to save results." -ForegroundColor DarkGray
+Write-Host "       e.g. .\Get-IWCAllowListConfig.ps1 -ExportHtml" -ForegroundColor DarkGray
+Write-Host "            .\Get-IWCAllowListConfig.ps1 -ExportCsv -ExportHtml" -ForegroundColor DarkGray
 Write-Host ""
